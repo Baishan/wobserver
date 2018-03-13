@@ -1,4 +1,5 @@
 defmodule Wobserver.Util.Application do
+  require Logger
   @moduledoc ~S"""
   Application listing and process hierachy.
   """
@@ -37,12 +38,17 @@ defmodule Wobserver.Util.Application do
       app
       |> :application_controller.get_master
 
-    %{
+    {:ok, pid_map} = Agent.start(fn  -> MapSet.new end)
+
+    response = %{
       pid: app_pid,
-      children: app_pid |> :application_master.get_child |> structure_pid(),
+      children: app_pid |> :application_master.get_child |> structure_pid(pid_map),
       name: name(app_pid),
       meta: Process.meta(app_pid),
     }
+
+    Agent.stop(pid_map)
+    response
   end
 
   # Helpers
@@ -63,8 +69,9 @@ defmodule Wobserver.Util.Application do
     }
   end
 
-  defp structure_pid({pid, name}) do
-    child = structure_pid({name, pid, :supervisor, []})
+  defp structure_pid({pid, name}, pid_map) do
+    Agent.update(pid_map, &MapSet.put(&1, pid))
+    child = structure_pid({name, pid, :supervisor, []}, pid_map)
 
     {_, dictionary} = :erlang.process_info pid, :dictionary
 
@@ -81,9 +88,10 @@ defmodule Wobserver.Util.Application do
     end
   end
 
-  defp structure_pid({_, :undefined, _, _}), do: nil
+  defp structure_pid({_, :undefined, _, _}, _), do: nil
 
-  defp structure_pid({_, pid, :supervisor, _}) do
+  defp structure_pid({_, pid, :supervisor, _}, pid_map) do
+    Agent.update(pid_map, &MapSet.put(&1, pid))
     {:links, links} = :erlang.process_info(pid, :links)
 
     children =
@@ -94,7 +102,7 @@ defmodule Wobserver.Util.Application do
           pid
           |> :supervisor.which_children
           |> Kernel.++(Enum.filter(links, fn link -> is_port(link) end))
-          |> parallel_map(&structure_pid/1)
+          |> Enum.map(&structure_pid(&1, pid_map))
           |> Enum.filter(&(&1 != nil))
       end
 
@@ -106,16 +114,33 @@ defmodule Wobserver.Util.Application do
     }
   end
 
-  defp structure_pid({_, pid, :worker, _}) do
+  defp structure_pid({_, pid, :worker, _}, pid_map) do
+    Agent.update(pid_map, &MapSet.put(&1, pid))
+    {:links, links} = :erlang.process_info(pid, :links)
+    Logger.warn inspect(links)
+
+    children =
+      case Enum.count(links) do
+        1 ->
+          []
+        _ ->
+          links
+          |> Enum.map(&structure_link_pid(&1, pid_map))
+          |> Enum.filter(&(&1 != nil))
+      end
+
+
     %{
       pid: pid,
-      children: [],
+      children: children,
       name: name(pid),
       meta: Process.meta(pid),
     }
   end
 
-  defp structure_pid(port) when is_port(port) do
+
+  defp structure_link_pid(port, pid_map) when is_port(port), do: structure_pid(port, pid_map)
+  defp structure_pid(port, _) when is_port(port) do
     %{
       pid: port,
       children: [],
@@ -129,7 +154,50 @@ defmodule Wobserver.Util.Application do
     }
   end
 
-  defp structure_pid(_), do: nil
+  defp structure_link_pid(pid, pid_map) when is_pid(pid) do
+    Logger.warn "Child structure #{inspect name(pid)}, with map #{inspect Agent.get(pid_map, fn m -> m end)}"
+    if Agent.get(pid_map, &MapSet.member?(&1, pid)) do
+      Logger.warn "Found in map ignoring"
+      nil
+    else
+    Agent.update(pid_map, &MapSet.put(&1, pid))
+    {:links, links} = :erlang.process_info(pid, :links)
+
+    children = 
+      case Enum.count(links) do
+        1 ->
+          []
+        _ ->
+          Logger.warn inspect(links)
+          links
+          |> Enum.filter(fn p ->
+                {_, dictionary} = :erlang.process_info p, :dictionary
+                Logger.warn "Your dict #{inspect dictionary}"
+                has_it = Keyword.get(dictionary, :"$ancestors", [])
+                         |> Enum.map(fn
+                           p when is_pid(p) -> p
+                           p -> Elixir.Process.whereis(p)
+                         end)
+                |> Enum.member?(pid)
+
+                Logger.warn "#{inspect name(p)} has #{inspect name(pid)} as ance: #{inspect has_it}"
+                has_it
+          end)
+          |> Enum.map(&structure_link_pid(&1, pid_map))
+          |> Enum.filter(&(&1 != nil))
+      end
+
+    %{
+      pid: pid,
+      children: children,
+      name: name(pid),
+      meta: Process.meta(pid),
+    }
+    end
+  end
+
+
+  defp structure_pid(_, _), do: nil
 
   defp name(pid) do
     case :erlang.process_info(pid, :registered_name) do
